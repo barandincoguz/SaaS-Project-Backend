@@ -5,6 +5,7 @@ import {
   Get,
   UseGuards,
   Request,
+  Query,
 } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './jwt/jwt.guard';
@@ -22,11 +23,19 @@ export class AuthController {
   login(@Body() dto: { email: string; password: string }) {
     return this.authService.login(dto.email, dto.password);
   }
+  @Post('reset-password')
+  async resetPassword(@Body() dto: { token: string; newPassword: string }) {
+    return this.authService.resetPassword(dto.token, dto.newPassword);
+  }
 
-  // JWT ile korunan route
-  @UseGuards(JwtAuthGuard)
-  @Get('profile')
-  getProfile(@Request() req) {
-    return { user: req.user };
+  // ✅ GET route, query parametre ile token alıyor
+  @Get('verify-email')
+  async verifyEmail(@Query('token') token: string) {
+    return this.authService.verifyEmail(token);
+  }
+
+  @Post('request-password-reset')
+  async requestPasswordReset(@Body() dto: { email: string }) {
+    return this.authService.requestPasswordReset(dto.email);
   }
 }
