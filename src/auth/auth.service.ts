@@ -10,6 +10,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
 import * as nodemailer from 'nodemailer';
+import { createHash, randomBytes } from 'crypto';
 
 @Injectable()
 export class AuthService {
@@ -17,6 +18,7 @@ export class AuthService {
   private readonly jwtSecret: string;
   private readonly transporter: nodemailer.Transporter | null;
   private readonly frontendUrl: string;
+  private readonly resetTokenTtlMs = 15 * 60 * 1000;
 
   constructor(
     private prisma: PrismaService,
@@ -49,6 +51,7 @@ export class AuthService {
         'Email transporter is not fully configured. Email features are disabled.',
       );
     }
+    //BU URL FRONTEND'İN URL'Sİ SONRADAN METHODLARDA FORMLARA YONLENDIRECEGIZ
 
     this.frontendUrl =
       this.configService.get<string>('FRONTEND_URL') ?? 'http://localhost:3000';
@@ -210,27 +213,54 @@ export class AuthService {
       );
     }
 
-    try {
-      const payload = this.jwtService.verify<{ sub: number; type?: string }>(
-        token,
-        { secret: this.jwtSecret },
-      );
+    const tokenHash = this.hashToken(token);
+    const now = new Date();
 
-      if (payload.type && payload.type !== 'password_reset') {
-        throw new UnauthorizedException('Invalid token type');
-      }
+    const resetToken = await this.prisma.passwordResetToken.findUnique({
+      where: { tokenHash },
+      include: { user: true },
+    });
 
-      const hashed = await bcrypt.hash(newPassword, 12);
-      await this.prisma.user.update({
-        where: { id: payload.sub },
-        data: { password: hashed },
-      });
-      this.logger.log(`Password reset for user ID ${payload.sub}`);
-      return { message: 'Password reset successful' };
-    } catch (e) {
-      this.logger.warn(`Password reset failed: ${e.message}`);
+    if (!resetToken || !resetToken.user) {
+      this.logger.warn('Password reset attempted with invalid token');
       throw new UnauthorizedException('Invalid or expired token');
     }
+
+    if (resetToken.usedAt) {
+      this.logger.warn(
+        `Password reset attempted with already used token (id: ${resetToken.id})`,
+      );
+      throw new UnauthorizedException('Invalid or expired token');
+    }
+
+    if (resetToken.expiresAt.getTime() < now.getTime()) {
+      this.logger.warn(
+        `Password reset attempted with expired token (id: ${resetToken.id})`,
+      );
+      throw new UnauthorizedException('Invalid or expired token');
+    }
+
+    const hashed = await bcrypt.hash(newPassword, 12);
+
+    await this.prisma.$transaction([
+      this.prisma.user.update({
+        where: { id: resetToken.userId },
+        data: { password: hashed },
+      }),
+      this.prisma.passwordResetToken.update({
+        where: { id: resetToken.id },
+        data: { usedAt: now },
+      }),
+      this.prisma.passwordResetToken.deleteMany({
+        where: {
+          userId: resetToken.userId,
+          id: { not: resetToken.id },
+        },
+      }),
+    ]);
+
+    this.logger.log(`Password reset for user ID ${resetToken.userId}`);
+    return { message: 'Password reset successful' };
   }
 
   async requestPasswordReset(email: string) {
@@ -246,12 +276,28 @@ export class AuthService {
       return { message: 'If the email exists, a reset link has been sent.' };
     }
 
-    const resetToken = this.jwtService.sign(
-      { sub: user.id, type: 'password_reset' },
-      { secret: this.jwtSecret, expiresIn: '15m' },
-    );
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + this.resetTokenTtlMs);
+    const rawToken = randomBytes(32).toString('hex');
+    const tokenHash = this.hashToken(rawToken);
 
-    await this.sendPasswordResetEmail(user.email, resetToken);
+    await this.prisma.$transaction([
+      this.prisma.passwordResetToken.deleteMany({
+        where: {
+          userId: user.id,
+          OR: [{ usedAt: { not: null } }, { expiresAt: { lt: now } }],
+        },
+      }),
+      this.prisma.passwordResetToken.create({
+        data: {
+          userId: user.id,
+          tokenHash,
+          expiresAt,
+        },
+      }),
+    ]);
+
+    await this.sendPasswordResetEmail(user.email, rawToken);
     this.logger.log(`Password reset email queued for ${user.email}`);
 
     return { message: 'If the email exists, a reset link has been sent.' };
@@ -281,5 +327,9 @@ export class AuthService {
         error as Error,
       );
     }
+  }
+
+  private hashToken(token: string): string {
+    return createHash('sha256').update(token).digest('hex');
   }
 }
